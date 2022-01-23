@@ -13,7 +13,8 @@ struct Result {
   Word guess;
   Comparison comparisons[WORD_LEN];
 
-  __host__ __device__ constexpr bool allows_word(Word word) const noexcept {
+  __host__ __device__ constexpr bool
+  allows_word(const Word &word) const noexcept {
     for (std::uint32_t i = 0; i < WORD_LEN; ++i) {
       switch (comparisons[i]) {
       case Comparison::Absent: {
@@ -46,8 +47,8 @@ struct Result {
   }
 };
 
-__host__ __device__ constexpr Result make_result(Word guess,
-                                                 Word answer) noexcept {
+__host__ __device__ constexpr Result make_result(const Word &guess,
+                                                 const Word &answer) noexcept {
   Result result = {guess};
 
   for (std::uint32_t i = 0; i < WORD_LEN; ++i) {

@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -21,6 +22,10 @@
 #include <vector>
 
 #include <cuda.h>
+
+#ifdef __clang__
+#include "__clang_cuda_intrinsics.h"
+#endif
 
 enum class TestResult {
   ExactMatch,
@@ -96,12 +101,17 @@ inline constexpr std::uint32_t GUESSES_PER_BLOCK = BLOCK_DIM;
 inline constexpr std::uint32_t ANSWERS_PER_BLOCK = BLOCK_DIM;
 inline constexpr std::uint32_t BLOCK_SIZE =
     GUESSES_PER_BLOCK * ANSWERS_PER_BLOCK;
+inline constexpr std::uint32_t WARP_SIZE = 32;
+inline constexpr std::uint32_t WARPS_PER_BLOCK = BLOCK_SIZE / WARP_SIZE;
+static_assert(BLOCK_SIZE % WARP_SIZE == 0);
 
 __global__ static void get_num_allowed_words(
     const Word *guesses, std::uint32_t num_guesses, const Word *answers,
     std::uint32_t num_answers,
     std::uint32_t *num_allowed_words, /* num_answer rows x num_guesses cols */
     std::uint32_t num_allowed_words_pitch) {
+  assert(WARP_SIZE == warpSize);
+
   const std::uint32_t this_block_first_guess_idx = blockIdx.x * blockDim.x;
   const std::uint32_t this_block_first_answer_idx = blockIdx.y * blockDim.y;
 
@@ -117,6 +127,8 @@ __global__ static void get_num_allowed_words(
       this_block_first_answer_idx + threadIdx.y;
 
   const std::uint32_t thread_idx = blockDim.x * threadIdx.y + threadIdx.x;
+  const std::uint32_t warp_idx = thread_idx / WARP_SIZE;
+  const std::uint32_t warp_thread_idx = thread_idx % WARP_SIZE;
 
   __shared__ Word block_guesses[GUESSES_PER_BLOCK];
   if (thread_idx < GUESSES_PER_BLOCK) {
@@ -141,28 +153,31 @@ __global__ static void get_num_allowed_words(
   const Result this_thread_result =
       make_result(this_thread_guess, this_thread_answer);
 
-  __shared__ Word block_answers_to_test[BLOCK_SIZE];
-
   std::uint32_t this_thread_num_allowed = 0;
 
-  for (std::uint32_t i = 0; i < num_answers; i += BLOCK_SIZE) {
-    const std::uint32_t last_test_idx = min(i + BLOCK_SIZE, num_answers);
+  for (std::uint32_t i = 0; i < num_answers; i += WARP_SIZE) {
+    const std::uint32_t last_test_idx = min(i + WARP_SIZE, num_answers);
     const std::uint32_t num_to_test = last_test_idx - i;
 
-    if (thread_idx < num_to_test) {
-      block_answers_to_test[thread_idx] = answers[i + thread_idx];
+    const unsigned active_mask = ~unsigned(0);
+    const bool this_thread_will_collect_data = warp_thread_idx < num_to_test;
+    const unsigned has_data_mask =
+        __ballot_sync(active_mask, this_thread_will_collect_data);
+
+    Word this_thread_answer_to_share;
+    if (this_thread_will_collect_data) {
+      this_thread_answer_to_share = answers[i + warp_thread_idx];
     }
 
-    __syncthreads();
+    for (std::uint32_t i = 0; i < num_to_test; ++i) {
+      Word this_answer_to_test;
+      this_answer_to_test.storage =
+          __shfl_sync(active_mask, this_thread_answer_to_share.storage, i);
 
-    for (std::uint32_t j = 0; j < num_to_test; ++j) {
-      const Word this_answer_to_test = block_answers_to_test[j];
       if (this_thread_result.allows_word(this_answer_to_test)) {
         ++this_thread_num_allowed;
       }
     }
-
-    __syncthreads();
   }
 
   if ((this_thread_answer_idx < num_answers) &&
