@@ -57,53 +57,74 @@ struct Result {
     return (conditions_met[0] == ~std::uint32_t(0)) &&
            (conditions_met[1] == std::uint32_t(0xff));
   }
+
+  __host__ __device__ constexpr void fill_lanes() noexcept {
+    is_exact_match[0] = 0;
+    is_exact_match[1] = 0;
+
+    is_contained[0] = 0;
+    is_contained[1] = 0;
+
+    is_absent[0] = 0;
+    is_absent[1] = 0;
+
+    for (std::uint32_t i = 0; i < WORD_LEN; ++i) {
+      const unsigned char ch = guess.char_at(i);
+
+      const std::uint32_t this_ch_pos_mask =
+          (std::uint32_t(0xff) << (8 * (i % 4)));
+
+      switch (comparisons[i]) {
+      case Comparison::Absent: {
+        is_absent[i / 4] |= this_ch_pos_mask;
+        break;
+      }
+
+      case Comparison::ExactMatch: {
+        is_exact_match[i / 4] |= this_ch_pos_mask;
+        break;
+      }
+
+      case Comparison::Contained: {
+        is_contained[i / 4] |= this_ch_pos_mask;
+        break;
+      }
+      }
+
+      guess_wide[i] = (std::uint32_t(ch) << 24) | (std::uint32_t(ch) << 16) |
+                      (std::uint32_t(ch) << 8) | (std::uint32_t(ch) << 0);
+    }
+
+    is_index[0][0] = std::uint32_t(0xff) << 0;
+    is_index[0][1] = std::uint32_t(0);
+    is_index[1][0] = std::uint32_t(0xff) << 8;
+    is_index[1][1] = std::uint32_t(0);
+    is_index[2][0] = std::uint32_t(0xff) << 16;
+    is_index[2][1] = std::uint32_t(0);
+    is_index[3][0] = std::uint32_t(0xff) << 24;
+    is_index[3][1] = std::uint32_t(0);
+    is_index[4][0] = std::uint32_t(0);
+    is_index[4][1] = std::uint32_t(0xff) << 0;
+  }
 };
 
 __host__ __device__ constexpr Result make_result(const Word &guess,
                                                  const Word &answer) noexcept {
   Result result = {guess};
 
-  result.is_exact_match[0] = 0;
-  result.is_exact_match[1] = 0;
-
-  result.is_contained[0] = 0;
-  result.is_contained[1] = 0;
-
-  result.is_absent[0] = 0;
-  result.is_absent[1] = 0;
-
   for (std::uint32_t i = 0; i < WORD_LEN; ++i) {
     const unsigned char ch = guess.char_at(i);
 
-    const std::uint32_t this_ch_pos_mask =
-        (std::uint32_t(0xff) << (8 * (i % 4)));
-
     if (answer.has_char_at(ch, i)) {
       result.comparisons[i] = Comparison::ExactMatch;
-      result.is_exact_match[i / 4] |= this_ch_pos_mask;
     } else if (answer.contains_char(ch)) {
       result.comparisons[i] = Comparison::Contained;
-      result.is_contained[i / 4] |= this_ch_pos_mask;
     } else {
       result.comparisons[i] = Comparison::Absent;
-      result.is_absent[i / 4] |= this_ch_pos_mask;
     }
-
-    result.guess_wide[i] = (std::uint32_t(ch) << 24) |
-                           (std::uint32_t(ch) << 16) |
-                           (std::uint32_t(ch) << 8) | (std::uint32_t(ch) << 0);
   }
 
-  result.is_index[0][0] = std::uint32_t(0xff) << 0;
-  result.is_index[0][1] = std::uint32_t(0);
-  result.is_index[1][0] = std::uint32_t(0xff) << 8;
-  result.is_index[1][1] = std::uint32_t(0);
-  result.is_index[2][0] = std::uint32_t(0xff) << 16;
-  result.is_index[2][1] = std::uint32_t(0);
-  result.is_index[3][0] = std::uint32_t(0xff) << 24;
-  result.is_index[3][1] = std::uint32_t(0);
-  result.is_index[4][0] = std::uint32_t(0);
-  result.is_index[4][1] = std::uint32_t(0xff) << 0;
+  result.fill_lanes();
 
   return result;
 }

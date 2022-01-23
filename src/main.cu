@@ -332,6 +332,8 @@ static int prune_answers(const std::string &guess_str,
     }
   }
 
+  result.fill_lanes();
+
   const std::vector<Word> answers = read_line_delimited_words(answers_pathname);
 
   const std::size_t num_answers = answers.size();
