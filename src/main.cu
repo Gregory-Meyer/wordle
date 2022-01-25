@@ -15,6 +15,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -36,6 +37,7 @@ enum class TestResult {
 struct GuessStats {
   double average_wordlist_len;
   double wordlist_len_variance;
+  std::uint32_t max_wordlist_len;
 };
 
 __global__ static void compute_stats(std::uint32_t num_inputs,
@@ -45,17 +47,21 @@ __global__ static void compute_stats(std::uint32_t num_inputs,
                                      GuessStats *stats) {
   const std::uint32_t guess_word_idx = (blockIdx.x * blockDim.x) + threadIdx.x;
 
-  GuessStats this_guess_stats = {0.0, 0.0};
+  GuessStats this_guess_stats = {0.0, 0.0, 0};
 
   if (guess_word_idx < num_inputs) {
     double sum = 0.0;
     double c = 0.0;
 
     for (std::uint32_t i = 0; i < num_answers; ++i) {
-      const auto this_actual_num_allowed = double(ptr_offset(
-          num_allowed_words, num_allowed_words_pitch, i)[guess_word_idx]);
+      const std::uint32_t this_actual_num_allowed = ptr_offset(
+          num_allowed_words, num_allowed_words_pitch, i)[guess_word_idx];
 
-      const double y = this_actual_num_allowed - c;
+      if (this_actual_num_allowed > this_guess_stats.max_wordlist_len) {
+        this_guess_stats.max_wordlist_len = this_actual_num_allowed;
+      }
+
+      const double y = double(this_actual_num_allowed) - c;
       const double t = sum + y;
       c = t - sum - y;
       sum = t;
@@ -96,9 +102,8 @@ __global__ static void filter_answers(Result result, const Word *answers,
   }
 }
 
-inline constexpr std::uint32_t BLOCK_DIM = 32;
-inline constexpr std::uint32_t GUESSES_PER_BLOCK = BLOCK_DIM;
-inline constexpr std::uint32_t ANSWERS_PER_BLOCK = BLOCK_DIM;
+inline constexpr std::uint32_t GUESSES_PER_BLOCK = 32;
+inline constexpr std::uint32_t ANSWERS_PER_BLOCK = 32;
 inline constexpr std::uint32_t BLOCK_SIZE =
     GUESSES_PER_BLOCK * ANSWERS_PER_BLOCK;
 inline constexpr std::uint32_t WARP_SIZE = 32;
@@ -150,8 +155,8 @@ __global__ static void get_num_allowed_words(
 
   const Word this_thread_guess = block_guesses[threadIdx.x];
   const Word this_thread_answer = block_answers[threadIdx.y];
-  const Result this_thread_result =
-      make_result(this_thread_guess, this_thread_answer);
+  const auto this_thread_result =
+      Result::from_answer(this_thread_guess, this_thread_answer);
 
   std::uint32_t this_thread_num_allowed = 0;
 
@@ -191,7 +196,15 @@ __global__ static void get_num_allowed_words(
 struct EvaluatedWord {
   Word word;
   GuessStats stats;
+  bool is_not_answer;
 };
+
+auto as_tuple(const EvaluatedWord &evaluated) noexcept {
+  return std::make_tuple(
+      evaluated.stats.average_wordlist_len, evaluated.stats.max_wordlist_len,
+      evaluated.stats.wordlist_len_variance, evaluated.is_not_answer ? 1 : 0,
+      std::cref(evaluated.word));
+}
 
 static constexpr std::size_t div_round_up(std::size_t num,
                                           std::size_t den) noexcept {
@@ -218,8 +231,8 @@ static int compute_scores(const std::string &inputs_pathname,
     return EXIT_FAILURE;
   }
 
-  const std::size_t num_inputs = inputs.size();
-  const std::size_t num_answers = answers.size();
+  const std::uint32_t num_inputs = inputs.size();
+  const std::uint32_t num_answers = answers.size();
   std::cout << "loaded " << num_inputs << " allowed inputs\n";
   std::cout << "loaded " << num_answers << " potential answers\n";
 
@@ -231,10 +244,37 @@ static int compute_scores(const std::string &inputs_pathname,
 
   const auto stats_device = make_unique_device<GuessStats>(num_inputs);
 
-  const std::size_t num_guess_blocks =
+  const std::uint32_t num_guess_blocks =
       div_round_up(num_inputs, GUESSES_PER_BLOCK);
-  const std::size_t num_answer_blocks =
-      div_round_up(num_answers, GUESSES_PER_BLOCK);
+  const std::uint32_t num_answer_blocks =
+      div_round_up(num_answers, ANSWERS_PER_BLOCK);
+
+  cudaDeviceProp properties;
+  check_cuda(cudaGetDeviceProperties(&properties, 0));
+  std::cout << properties.regsPerBlock << " registers per block\n";
+  std::cout << properties.regsPerMultiprocessor
+            << " registers per multiprocessor\n";
+  std::cout << properties.sharedMemPerBlock
+            << " bytes of shared memory per block\n";
+  std::cout << properties.sharedMemPerBlockOptin
+            << " bytes of shared memory per block, opt-in\n";
+  std::cout << properties.sharedMemPerMultiprocessor
+            << " bytes of shared memory per multiprocessor\n";
+  std::cout << properties.maxThreadsPerBlock << " threads per block\n";
+  std::cout << properties.maxThreadsPerMultiProcessor
+            << " threads per multiprocessor\n";
+
+  cudaFuncAttributes attributes;
+  check_cuda(cudaFuncGetAttributes(&attributes, get_num_allowed_words));
+  std::cout << attributes.constSizeBytes
+            << " bytes of constant memory requested\n";
+  std::cout << attributes.localSizeBytes
+            << " bytes of local memory requested\n";
+  std::cout << attributes.maxDynamicSharedSizeBytes
+            << " bytes of shared memory requested\n";
+  std::cout << attributes.maxThreadsPerBlock
+            << " threads per block requested\n";
+  std::cout << attributes.numRegs << " registers per thread requested\n";
 
   get_num_allowed_words<<<dim3(num_guess_blocks, num_answer_blocks, 1),
                           dim3(GUESSES_PER_BLOCK, ANSWERS_PER_BLOCK, 1)>>>(
@@ -251,38 +291,43 @@ static int compute_scores(const std::string &inputs_pathname,
 
   copy_to_host_pitched(num_allowed_words_device.get(),
                        num_allowed_words_device_pitch, num_allowed_words.data(),
-                       num_inputs * sizeof(std::uint32_t), num_inputs,
+                       num_inputs * sizeof(num_allowed_words[0]), num_inputs,
                        num_answers);
 
   std::vector<GuessStats> stats(num_inputs);
 
   copy_to_host(stats_device.get(), stats.data(), num_inputs);
 
+  std::set<Word> answers_set(answers.cbegin(), answers.cend());
+
   std::vector<EvaluatedWord> evaluated;
   evaluated.reserve(num_inputs);
 
   for (std::size_t i = 0; i < num_inputs; ++i) {
-    evaluated.push_back(EvaluatedWord{inputs[i], stats[i]});
+    evaluated.push_back(
+        EvaluatedWord{inputs[i], stats[i], answers_set.count(inputs[i]) == 0});
   }
 
   std::sort(evaluated.begin(), evaluated.end(),
             [](const EvaluatedWord &lhs, const EvaluatedWord &rhs) {
-              return lhs.stats.average_wordlist_len <
-                     rhs.stats.average_wordlist_len;
+              return as_tuple(lhs) < as_tuple(rhs);
             });
 
   std::cout << "evaluated wordlist sizes of " << num_inputs
             << " allowed inputs\n";
 
-  if (!(output << "guess,average_num_allowed,num_allowed_variance\n")) {
+  if (!(output << "guess,is_potential_answer,average_num_allowed,num_allowed_"
+                  "variance,max_wordlist_len\n")) {
     std::cout << "error: couldn't write to '" << output_pathname << "'\n";
     return EXIT_FAILURE;
   }
 
   for (const EvaluatedWord &this_evaluated : evaluated) {
     if (!(output << this_evaluated.word << ','
+                 << (this_evaluated.is_not_answer ? "false" : "true") << ','
                  << this_evaluated.stats.average_wordlist_len << ','
-                 << this_evaluated.stats.wordlist_len_variance << '\n')) {
+                 << this_evaluated.stats.wordlist_len_variance << ','
+                 << this_evaluated.stats.max_wordlist_len << '\n')) {
       std::cout << "error: couldn't write to '" << output_pathname << "'\n";
       return EXIT_FAILURE;
     }
@@ -314,17 +359,17 @@ static int prune_answers(const std::string &guess_str,
     return EXIT_FAILURE;
   }
 
-  Result result = {guess};
+  Comparison comparisons[WORD_LEN];
 
   for (std::size_t i = 0; i < WORD_LEN; ++i) {
     const char ch = result_str[i];
 
     if ((ch == 'E') || (ch == 'e')) {
-      result.comparisons[i] = Comparison::ExactMatch;
+      comparisons[i] = Comparison::ExactMatch;
     } else if ((ch == 'C') || (ch == 'c')) {
-      result.comparisons[i] = Comparison::Contained;
+      comparisons[i] = Comparison::Contained;
     } else if ((ch == 'A') || (ch == 'a')) {
-      result.comparisons[i] = Comparison::Absent;
+      comparisons[i] = Comparison::Absent;
     } else {
       std::cerr << "error: result '" << guess_str
                 << "' is not a valid result\n";
@@ -332,7 +377,7 @@ static int prune_answers(const std::string &guess_str,
     }
   }
 
-  result.fill_lanes();
+  const auto result = Result::from_comparisons(guess, comparisons);
 
   const std::vector<Word> answers = read_line_delimited_words(answers_pathname);
 

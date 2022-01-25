@@ -3,130 +3,204 @@
 
 #include "word.hpp"
 
+#include <cstdint>
+
 enum class Comparison {
   Absent,
   ExactMatch,
   Contained,
 };
 
-struct Result {
-  Word guess;
-  std::uint32_t guess_wide[WORD_LEN];
-  std::uint32_t is_absent[2];
-  std::uint32_t is_exact_match[2];
-  std::uint32_t is_contained[2];
-  std::uint32_t is_index[WORD_LEN][2];
+template <typename T, std::uint32_t N>
+__host__ __device__ constexpr void zero_fill(T (&arr)[N]) noexcept {
+  for (std::uint32_t i = 0; i < N; ++i) {
+    arr[i] = T(0);
+  }
+}
 
-  Comparison comparisons[WORD_LEN];
-
-  __device__ bool allows_word(const Word &word) const noexcept {
-    const std::uint32_t guess_matches_word[2] = {
-        __vcmpeq4(guess.storage_u32[0], word.storage_u32[0]),
-        __vcmpeq4(guess.storage_u32[1], word.storage_u32[1]),
+class Result {
+public:
+  __host__ __device__ static Result from_answer(const Word &guess,
+                                                const Word &answer) noexcept {
+    struct char_map_entry {
+      unsigned char ch;
+      std::uint32_t num_occurences;
     };
 
-    std::uint32_t contains_char_at[2] = {0, 0};
+    Result result = {guess};
+
+    std::uint32_t num_unique_chars = 0;
+    struct char_map_entry char_map[WORD_LEN] = {0};
+
     for (std::uint32_t i = 0; i < WORD_LEN; ++i) {
-      const std::uint32_t low = __vcmpeq4(guess_wide[i], word.storage_u32[0]);
-      const std::uint32_t high = __vcmpeq4(guess_wide[i], word.storage_u32[1]);
+      const unsigned char ch = answer.char_at(i);
 
-      const std::uint32_t contains_this_char =
-          (low | high) != 0 ? ~std::uint32_t(0) : 0;
+      bool have_char_already = false;
+      for (std::uint32_t j = 0; j < num_unique_chars; ++j) {
+        if (char_map[j].ch == ch) {
+          have_char_already = true;
+          ++char_map[j].num_occurences;
 
-      contains_char_at[0] |= contains_this_char & is_index[i][0];
-      contains_char_at[1] |= contains_this_char & is_index[i][1];
+          break;
+        }
+      }
+
+      if (!have_char_already) {
+        char_map[num_unique_chars].ch = ch;
+        char_map[num_unique_chars].num_occurences = 1;
+        ++num_unique_chars;
+      }
     }
 
-    const std::uint32_t has_required_match[2] = {
-        guess_matches_word[0] & is_exact_match[0],
-        guess_matches_word[1] & is_exact_match[1]};
-    const std::uint32_t contains_required_char[2] = {
-        contains_char_at[0] & is_contained[0],
-        contains_char_at[1] & is_contained[1]};
-    const std::uint32_t doesnt_contain_required_absent_char[2] = {
-        ~contains_char_at[0] & is_absent[0],
-        ~contains_char_at[1] & is_absent[1]};
+    for (std::uint32_t i = 0; i < WORD_LEN; ++i) {
+      const unsigned char guess_ch = guess.char_at(i);
 
-    const std::uint32_t conditions_met[2] = {
-        has_required_match[0] | contains_required_char[0] |
-            doesnt_contain_required_absent_char[0],
-        has_required_match[1] | contains_required_char[1] |
-            doesnt_contain_required_absent_char[1],
-    };
+      if (answer.has_char_at(guess_ch, i)) {
+        result.comparisons[i] = Comparison::ExactMatch;
 
-    return (conditions_met[0] == ~std::uint32_t(0)) &&
-           (conditions_met[1] == std::uint32_t(0xff));
+        for (std::uint32_t j = 0; j < num_unique_chars; ++j) {
+          if (char_map[j].ch == guess_ch) {
+            --char_map[j].num_occurences;
+
+            break;
+          }
+        }
+      }
+    }
+
+    for (std::uint32_t i = 0; i < WORD_LEN; ++i) {
+      const unsigned char guess_ch = guess.char_at(i);
+
+      if (!answer.has_char_at(guess_ch, i)) {
+        result.comparisons[i] = Comparison::Absent;
+
+        for (std::uint32_t j = 0; j < num_unique_chars; ++j) {
+          if ((char_map[j].ch == guess_ch) &&
+              (char_map[j].num_occurences > 0)) {
+            result.comparisons[i] = Comparison::Contained;
+            --char_map[j].num_occurences;
+
+            break;
+          }
+        }
+      }
+    }
+
+    result.fill_lanes();
+
+    return result;
   }
 
+  __host__ __device__ static Result
+  from_comparisons(const Word &guess,
+                   const Comparison (&comparisons)[WORD_LEN]) noexcept {
+    Result result = {guess};
+
+    for (std::uint32_t i = 0; i < WORD_LEN; ++i) {
+      result.comparisons[i] = comparisons[i];
+    }
+
+    result.fill_lanes();
+
+    return result;
+  }
+
+  __device__ bool allows_word(const Word &word) const noexcept {
+    const WordVec guess_matches_word = guess.vec == word.vec;
+
+    WordVec occurences_not_in_exact_match_positions = WordVec::zeros();
+
+    for (std::uint32_t i = 0; i < WORD_LEN; ++i) {
+      const WordVec equals_this_char = word.vec == char_at_broadcast[i];
+      const WordVec equals_this_char_and_not_in_exact_match_position =
+          equals_this_char & is_occurences_bounds_check;
+      const int num_occurences_not_in_exact_match_positions =
+          count_lanes_set(equals_this_char_and_not_in_exact_match_position);
+
+      occurences_not_in_exact_match_positions |= WordVec::with_byte_at_index(
+          num_occurences_not_in_exact_match_positions, i);
+    }
+
+    const WordVec has_required_match = guess_matches_word & is_exact_match;
+
+    const WordVec meets_lower_bound =
+        occurences_not_in_exact_match_positions >=
+        lower_bound_equal_to_this_char_but_not_exact_match;
+    const WordVec meets_upper_bound =
+        occurences_not_in_exact_match_positions <=
+        upper_bound_equal_to_this_char_but_not_exact_match;
+    const WordVec meets_bounds =
+        (meets_lower_bound & meets_upper_bound) & is_occurences_bounds_check;
+
+    const WordVec conditions_met = has_required_match | meets_bounds;
+
+    return are_all_set(conditions_met | ~WordVec::relevant_mask());
+  }
+
+private:
+  __host__ __device__ Result(const Word &word) noexcept : guess(word) {}
+
   __host__ __device__ constexpr void fill_lanes() noexcept {
-    is_exact_match[0] = 0;
-    is_exact_match[1] = 0;
-
-    is_contained[0] = 0;
-    is_contained[1] = 0;
-
-    is_absent[0] = 0;
-    is_absent[1] = 0;
+    is_exact_match = WordVec::zeros();
+    is_occurences_bounds_check = WordVec::zeros();
+    lower_bound_equal_to_this_char_but_not_exact_match = WordVec::zeros();
+    upper_bound_equal_to_this_char_but_not_exact_match = WordVec::zeros();
 
     for (std::uint32_t i = 0; i < WORD_LEN; ++i) {
       const unsigned char ch = guess.char_at(i);
-
-      const std::uint32_t this_ch_pos_mask =
-          (std::uint32_t(0xff) << (8 * (i % 4)));
+      const WordVec this_mask = WordVec::mask_for_index(i);
 
       switch (comparisons[i]) {
-      case Comparison::Absent: {
-        is_absent[i / 4] |= this_ch_pos_mask;
-        break;
-      }
-
       case Comparison::ExactMatch: {
-        is_exact_match[i / 4] |= this_ch_pos_mask;
+        is_exact_match |= this_mask;
         break;
       }
 
+      case Comparison::Absent:
       case Comparison::Contained: {
-        is_contained[i / 4] |= this_ch_pos_mask;
+        is_occurences_bounds_check |= this_mask;
+
+        int lower_bound = 0;
+        int upper_bound = WORD_LEN;
+
+        bool has_absent = false;
+        for (std::uint32_t j = 0; j < WORD_LEN; ++j) {
+          if (guess.has_char_at(ch, j)) {
+            if (comparisons[j] == Comparison::Contained) {
+              ++lower_bound;
+            } else if (comparisons[j] == Comparison::Absent) {
+              has_absent = true;
+            }
+          }
+        }
+
+        if (has_absent) {
+          upper_bound = lower_bound;
+        }
+
+        lower_bound_equal_to_this_char_but_not_exact_match |=
+            WordVec::with_byte_at_index(lower_bound, i);
+        upper_bound_equal_to_this_char_but_not_exact_match |=
+            WordVec::with_byte_at_index(upper_bound, i);
+
         break;
       }
       }
 
-      guess_wide[i] = (std::uint32_t(ch) << 24) | (std::uint32_t(ch) << 16) |
-                      (std::uint32_t(ch) << 8) | (std::uint32_t(ch) << 0);
+      char_at_broadcast[i] = WordVec::broadcast_scalar_to_elem(ch);
     }
 
-    is_index[0][0] = std::uint32_t(0xff) << 0;
-    is_index[0][1] = std::uint32_t(0);
-    is_index[1][0] = std::uint32_t(0xff) << 8;
-    is_index[1][1] = std::uint32_t(0);
-    is_index[2][0] = std::uint32_t(0xff) << 16;
-    is_index[2][1] = std::uint32_t(0);
-    is_index[3][0] = std::uint32_t(0xff) << 24;
-    is_index[3][1] = std::uint32_t(0);
-    is_index[4][0] = std::uint32_t(0);
-    is_index[4][1] = std::uint32_t(0xff) << 0;
+    guess.vec &= WordVec::relevant_mask();
   }
+
+  Word guess;
+  WordVecElem char_at_broadcast[WORD_LEN];
+  WordVec is_exact_match;
+  WordVec is_occurences_bounds_check;
+
+  WordVec lower_bound_equal_to_this_char_but_not_exact_match;
+  WordVec upper_bound_equal_to_this_char_but_not_exact_match;
+
+  Comparison comparisons[WORD_LEN];
 };
-
-__host__ __device__ constexpr Result make_result(const Word &guess,
-                                                 const Word &answer) noexcept {
-  Result result = {guess};
-
-  for (std::uint32_t i = 0; i < WORD_LEN; ++i) {
-    const unsigned char ch = guess.char_at(i);
-
-    if (answer.has_char_at(ch, i)) {
-      result.comparisons[i] = Comparison::ExactMatch;
-    } else if (answer.contains_char(ch)) {
-      result.comparisons[i] = Comparison::Contained;
-    } else {
-      result.comparisons[i] = Comparison::Absent;
-    }
-  }
-
-  result.fill_lanes();
-
-  return result;
-}
-
 #endif
